@@ -81,3 +81,15 @@ desplegada:
 
 Ninguna de las dos necesita parámetros ni autenticación — son GET públicos de
 solo lectura, pensados para que el agente los llame directo.
+
+## Nota de despliegue real (Render)
+
+Desplegado en: https://sre-voice-agent-backend.onrender.com
+
+Render usa Python 3.14 por defecto para servicios nuevos, y `pydantic-core`
+todavía no publica wheel precompilado para esa versión (intenta compilar
+desde código fuente con Rust/maturin y falla por sistema de archivos de
+solo lectura). Solución: en el servicio, pestaña **Environment**, agrega la
+variable `PYTHON_VERSION=3.11.9` y vuelve a desplegar. El archivo
+`runtime.txt` ya NO es el mecanismo soportado por Render — usa la variable
+de entorno o un archivo `.python-version`.

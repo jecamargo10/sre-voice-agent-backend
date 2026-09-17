@@ -12,17 +12,28 @@ Endpoints:
   GET  /metrics       -> metricas de error/latencia de las tres nubes
   POST /simulate      -> fuerza un estado/metrica para una nube (control del demo)
   POST /reset          -> vuelve todo a la linea base "todo OK"
+  POST /escalate       -> crea un ticket de escalamiento en Zendesk (proxy, tool create_escalation)
 
 Ejecutar local:
   pip install -r requirements.txt
   uvicorn main:app --reload --port 8000
 
 Deploy: ver README.md (Render / Railway / Fly.io).
+
+Variables de entorno (Render -> Environment):
+  ZENDESK_SUBDOMAIN   ej. "alquimicos"
+  ZENDESK_TOKEN       el valor COMPLETO del header Authorization que Zendesk espera,
+                      ej. "Bearer abc123..." (token OAuth) o "Basic base64(email/token:API_TOKEN)"
+                      Este backend nunca lo expone: lo lee del entorno y lo reenvia a Zendesk.
+                      Si el token expira, se actualiza SOLO aqui (en Render) -- ElevenLabs
+                      no se toca para nada, porque apunta siempre a este mismo endpoint.
 """
 
+import os
 from datetime import datetime, timezone
 from typing import Literal, Optional
 
+import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -75,6 +86,16 @@ class SimulateRequest(BaseModel):
     detail: Optional[str] = None
     error_rate_pct: Optional[float] = None
     p99_latency_ms: Optional[int] = None
+
+
+class EscalateRequest(BaseModel):
+    subject: str
+    body: str
+    priority: Optional[Literal["low", "normal", "high", "urgent"]] = "normal"
+
+
+ZENDESK_SUBDOMAIN = os.environ.get("ZENDESK_SUBDOMAIN", "")
+ZENDESK_TOKEN = os.environ.get("ZENDESK_TOKEN", "")  # valor completo del header Authorization
 
 
 @app.get("/")
@@ -146,3 +167,45 @@ def get_status_one(provider: Provider):
 @app.get("/metrics/{provider}")
 def get_metrics_one(provider: Provider):
     return state["metrics"][provider]
+
+
+@app.post("/escalate")
+def escalate(req: EscalateRequest):
+    """
+    Proxy hacia Zendesk: crea un ticket de escalamiento. Tool: create_escalation.
+    El agente de ElevenLabs le pega a ESTE endpoint (sin credenciales de Zendesk),
+    y es este backend el que agrega el Authorization real antes de reenviar a Zendesk.
+    Asi, si el token de Zendesk expira, se renueva SOLO en la variable de entorno
+    ZENDESK_TOKEN de Render -- no hay que tocar nada en ElevenLabs.
+    """
+    if not ZENDESK_SUBDOMAIN or not ZENDESK_TOKEN:
+        raise HTTPException(
+            status_code=500,
+            detail="Backend mal configurado: falta ZENDESK_SUBDOMAIN o ZENDESK_TOKEN en las variables de entorno.",
+        )
+
+    url = f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets.json"
+    payload = {
+        "ticket": {
+            "subject": req.subject,
+            "comment": {"body": req.body},
+            "priority": req.priority,
+        }
+    }
+
+    try:
+        resp = httpx.post(
+            url,
+            headers={"Authorization": ZENDESK_TOKEN, "Content-Type": "application/json"},
+            json=payload,
+            timeout=10.0,
+        )
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail=f"No se pudo contactar a Zendesk: {exc}")
+
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"Zendesk respondio {resp.status_code}: {resp.text}")
+
+    data = resp.json()
+    ticket = data.get("ticket", {})
+    return {"ok": True, "ticket_id": ticket.get("id"), "url": ticket.get("url")}

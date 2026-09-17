@@ -21,15 +21,24 @@ Ejecutar local:
 Deploy: ver README.md (Render / Railway / Fly.io).
 
 Variables de entorno (Render -> Environment):
-  ZENDESK_SUBDOMAIN   ej. "alquimicos"
-  ZENDESK_TOKEN       el valor COMPLETO del header Authorization que Zendesk espera,
-                      ej. "Bearer abc123..." (token OAuth) o "Basic base64(email/token:API_TOKEN)"
-                      Este backend nunca lo expone: lo lee del entorno y lo reenvia a Zendesk.
-                      Si el token expira, se actualiza SOLO aqui (en Render) -- ElevenLabs
-                      no se toca para nada, porque apunta siempre a este mismo endpoint.
+  ZENDESK_SUBDOMAIN     ej. "alquimicos"
+  ZENDESK_CLIENT_ID     "Unique identifier" del OAuth client (debe ser tipo CONFIDENTIAL)
+  ZENDESK_CLIENT_SECRET Client Secret de ese mismo OAuth client
+  ZENDESK_SCOPE         opcional, default "tickets:read tickets:write"
+
+  Con estas 4 variables el backend saca su propio access token via el grant
+  "client_credentials" (machine-to-machine, sin navegador ni login humano) y lo
+  cachea en memoria. Si Zendesk lo rechaza (expirado/revocado), pide uno nuevo
+  automaticamente y reintenta una vez -- no hay token manual que se venza ni
+  flujo OAuth que repetir a mano.
+
+  Requisito en Zendesk: el OAuth client debe ser "Confidential" (no "Public"),
+  porque client_credentials no esta permitido para clients Publicos.
 """
 
 import os
+import threading
+import time
 from datetime import datetime, timezone
 from typing import Literal, Optional
 
@@ -95,7 +104,71 @@ class EscalateRequest(BaseModel):
 
 
 ZENDESK_SUBDOMAIN = os.environ.get("ZENDESK_SUBDOMAIN", "")
-ZENDESK_TOKEN = os.environ.get("ZENDESK_TOKEN", "")  # valor completo del header Authorization
+ZENDESK_CLIENT_ID = os.environ.get("ZENDESK_CLIENT_ID", "")
+ZENDESK_CLIENT_SECRET = os.environ.get("ZENDESK_CLIENT_SECRET", "")
+ZENDESK_SCOPE = os.environ.get("ZENDESK_SCOPE", "tickets:read tickets:write")
+
+# Cache en memoria del access token (client_credentials): se pide uno nuevo
+# solo cuando no hay token cacheado, cuando ya paso su expiracion, o cuando
+# Zendesk lo rechaza en caliente (401) durante una llamada real.
+_token_cache = {"access_token": None, "expires_at": 0.0}
+_token_lock = threading.Lock()
+
+
+def _fetch_zendesk_token() -> str:
+    """Pide un access token nuevo via client_credentials -- sin navegador, sin humano."""
+    if not ZENDESK_SUBDOMAIN or not ZENDESK_CLIENT_ID or not ZENDESK_CLIENT_SECRET:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Backend mal configurado: falta ZENDESK_SUBDOMAIN, ZENDESK_CLIENT_ID "
+                "o ZENDESK_CLIENT_SECRET en las variables de entorno."
+            ),
+        )
+    try:
+        resp = httpx.post(
+            f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/oauth/tokens",
+            headers={"Content-Type": "application/json"},
+            json={
+                "grant_type": "client_credentials",
+                "client_id": ZENDESK_CLIENT_ID,
+                "client_secret": ZENDESK_CLIENT_SECRET,
+                "scope": ZENDESK_SCOPE,
+            },
+            timeout=10.0,
+        )
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail=f"No se pudo contactar el endpoint de OAuth de Zendesk: {exc}")
+
+    if resp.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Zendesk rechazo la solicitud de token (revisa que el OAuth client sea "
+                f"'Confidential' y tenga el scope correcto): {resp.status_code} {resp.text}"
+            ),
+        )
+
+    data = resp.json()
+    token = data["access_token"]
+    expires_in = data.get("expires_in", 3600)
+    with _token_lock:
+        _token_cache["access_token"] = token
+        # Renovamos 60s antes de la expiracion real, con margen de seguridad.
+        _token_cache["expires_at"] = time.time() + max(expires_in - 60, 0)
+    return token
+
+
+def _get_zendesk_token(force_refresh: bool = False) -> str:
+    with _token_lock:
+        cached_ok = (
+            not force_refresh
+            and _token_cache["access_token"]
+            and time.time() < _token_cache["expires_at"]
+        )
+        if cached_ok:
+            return _token_cache["access_token"]
+    return _fetch_zendesk_token()
 
 
 @app.get("/")
@@ -173,15 +246,15 @@ def get_metrics_one(provider: Provider):
 def escalate(req: EscalateRequest):
     """
     Proxy hacia Zendesk: crea un ticket de escalamiento. Tool: create_escalation.
-    El agente de ElevenLabs le pega a ESTE endpoint (sin credenciales de Zendesk),
-    y es este backend el que agrega el Authorization real antes de reenviar a Zendesk.
-    Asi, si el token de Zendesk expira, se renueva SOLO en la variable de entorno
-    ZENDESK_TOKEN de Render -- no hay que tocar nada en ElevenLabs.
+    El agente de ElevenLabs le pega a ESTE endpoint (sin credenciales de Zendesk).
+    El backend obtiene su propio access token (client_credentials), lo cachea, y si
+    Zendesk lo rechaza por expirado/invalido pide uno nuevo y reintenta una vez sola
+    -- todo automatico, sin volver a pasar por el flujo OAuth de navegador.
     """
-    if not ZENDESK_SUBDOMAIN or not ZENDESK_TOKEN:
+    if not ZENDESK_SUBDOMAIN:
         raise HTTPException(
             status_code=500,
-            detail="Backend mal configurado: falta ZENDESK_SUBDOMAIN o ZENDESK_TOKEN en las variables de entorno.",
+            detail="Backend mal configurado: falta ZENDESK_SUBDOMAIN en las variables de entorno.",
         )
 
     url = f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets.json"
@@ -193,13 +266,21 @@ def escalate(req: EscalateRequest):
         }
     }
 
-    try:
-        resp = httpx.post(
+    def _post_with_token(bearer_token: str) -> httpx.Response:
+        return httpx.post(
             url,
-            headers={"Authorization": ZENDESK_TOKEN, "Content-Type": "application/json"},
+            headers={"Authorization": f"Bearer {bearer_token}", "Content-Type": "application/json"},
             json=payload,
             timeout=10.0,
         )
+
+    token = _get_zendesk_token()
+    try:
+        resp = _post_with_token(token)
+        if resp.status_code == 401:
+            # Token invalido/expirado antes de lo previsto: pide uno nuevo y reintenta UNA vez.
+            token = _get_zendesk_token(force_refresh=True)
+            resp = _post_with_token(token)
     except httpx.RequestError as exc:
         raise HTTPException(status_code=502, detail=f"No se pudo contactar a Zendesk: {exc}")
 

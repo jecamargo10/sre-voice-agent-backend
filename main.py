@@ -101,6 +101,11 @@ class EscalateRequest(BaseModel):
     subject: str
     body: str
     priority: Optional[Literal["low", "normal", "high", "urgent"]] = "normal"
+    # ID de la conversacion de ElevenLabs (system__conversation_id), pasado como
+    # Dynamic variable por la plataforma -- NUNCA lo decide el modelo. Con esto el
+    # backend puede des-duplicar aunque el agente llame esta tool mas de una vez
+    # para la misma llamada.
+    conversation_id: Optional[str] = None
 
 
 ZENDESK_SUBDOMAIN = os.environ.get("ZENDESK_SUBDOMAIN", "")
@@ -113,6 +118,15 @@ ZENDESK_SCOPE = os.environ.get("ZENDESK_SCOPE", "tickets:read tickets:write")
 # Zendesk lo rechaza en caliente (401) durante una llamada real.
 _token_cache = {"access_token": None, "expires_at": 0.0}
 _token_lock = threading.Lock()
+
+# Des-duplicacion de escalamientos: llave = conversation_id de ElevenLabs.
+# Si el agente llama create_escalation mas de una vez para la MISMA llamada
+# (reintento, confusion del modelo, lo que sea) esto evita abrir un segundo
+# ticket real en Zendesk -- la garantia vive aqui, no en que el prompt "se
+# acuerde" de que ya escalo. Se limpia en cada /reset y vive solo en memoria
+# (se resetea si el proceso se reinicia; suficiente para este demo).
+_escalations_by_conversation = {}
+_escalation_lock = threading.Lock()
 
 
 def _fetch_zendesk_token() -> str:
@@ -229,6 +243,8 @@ def reset():
     state["status"] = {k: v.copy() for k, v in BASELINE_STATUS.items()}
     state["metrics"] = {k: v.copy() for k, v in BASELINE_METRICS.items()}
     state["updated_at"] = datetime.now(timezone.utc).isoformat()
+    with _escalation_lock:
+        _escalations_by_conversation.clear()
     return {"ok": True, "status": state["status"], "metrics": state["metrics"]}
 
 
@@ -256,6 +272,15 @@ def escalate(req: EscalateRequest):
             status_code=500,
             detail="Backend mal configurado: falta ZENDESK_SUBDOMAIN en las variables de entorno.",
         )
+
+    # Si ya escalamos esta misma llamada (mismo conversation_id), devolvemos el
+    # ticket que ya existe en vez de crear uno nuevo -- pase lo que pase del
+    # lado del modelo.
+    if req.conversation_id:
+        with _escalation_lock:
+            cached = _escalations_by_conversation.get(req.conversation_id)
+        if cached is not None:
+            return {**cached, "already_escalated": True}
 
     url = f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets.json"
     payload = {
@@ -289,4 +314,10 @@ def escalate(req: EscalateRequest):
 
     data = resp.json()
     ticket = data.get("ticket", {})
-    return {"ok": True, "ticket_id": ticket.get("id"), "url": ticket.get("url")}
+    result = {"ok": True, "ticket_id": ticket.get("id"), "url": ticket.get("url")}
+
+    if req.conversation_id:
+        with _escalation_lock:
+            _escalations_by_conversation[req.conversation_id] = result
+
+    return result
